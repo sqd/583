@@ -15,6 +15,7 @@
 
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace llvm;
 using namespace std;
@@ -28,11 +29,20 @@ namespace {
 
     // we need this to compute lock set
     unordered_map<BasicBlock *, vector<Segment *>> mapBB2Seg;
-    
+
     struct OMPRacePass : public llvm::FunctionPass {
         bool runOnFunction(llvm::Function &F) override {
             if (!F.getName().startswith(".omp_outlined."))
                 return false; // not function of interest
+
+            AAQueryInfo aaqi;
+            auto &baa = getAnalysis<BasicAAWrapperPass>().getResult();
+            auto &snaaa = getAnalysis<ScopedNoAliasAAWrapperPass>().getResult();
+            auto &tbaa = getAnalysis<TypeBasedAAWrapperPass>().getResult();
+            auto &gaa = getAnalysis<GlobalsAAWrapperPass>().getResult();
+            auto &scevaa = getAnalysis<SCEVAAWrapperPass>().getResult();
+            auto &cflaaa = getAnalysis<CFLAndersAAWrapperPass>().getResult();
+            auto &cflsaa = getAnalysis<CFLSteensAAWrapperPass>().getResult();
 
             errs() << "Working on OpenMP outlined function " << F.getName() << '\n';
 
@@ -54,12 +64,8 @@ namespace {
                         break;
                     }
 
-                    if (op.getOpcode() == Instruction::Call) {
-                        auto *callee = op.getOperand(op.getNumOperands() - 1);
-                        assert(callee->getType()->isPointerTy() &&
-                               "call op's last argument should be a ptr to function");
-                        errs() << "callee name: " << callee->getName() << '\n';
-
+                    if (auto *callInst = dyn_cast<CallInst>(&op)) {
+                        Function *callee = callInst->getCalledFunction();
                         if (callee->getName().equals("omp_set_lock") ||
                             callee->getName().equals("omp_unset_lock") ||
                             callee->getName().equals("__kmpc_critical") ||
@@ -90,35 +96,62 @@ namespace {
             }
 
             // compute the lock set
+            // first, we make a list of all the locks
+            vector<MemoryLocation> explicitLocks; // for omp_lock_t
+            unordered_set<Value *> critLocks; // for critical sections
+            for (auto &bb: F) {
+                for (auto &op: bb)
+                    if (auto *callInst = dyn_cast<CallInst>(&op)) {
+                        Function *callee = callInst->getCalledFunction();
+                        if (callee->getName().equals("omp_set_lock") ||
+                            callee->getName().equals("omp_unset_lock")) {
+                            Value *regLock = callInst->getArgOperand(0);
+                            auto *loadLockInst = dyn_cast<LoadInst>(regLock);
+                            MemoryLocation memLoc = MemoryLocation::get(loadLockInst);
+                            // if this is a new lock
+                            auto it = find_if(explicitLocks.begin(), explicitLocks.end(),
+                                              [&](const MemoryLocation &o) {
+                                                  AliasResult aliasResult
+                                                          = getAliasResult(memLoc, o, aaqi,
+                                                                           baa, snaaa, tbaa, gaa,
+                                                                           scevaa, cflaaa, cflsaa);
+                                                  return aliasResult == MustAlias ||
+                                                         aliasResult == PartialAlias;
+                                              });
+                            if (it == explicitLocks.end())
+                                explicitLocks.push_back(memLoc);
+                        } else if (callee->getName().equals("__kmpc_critical") ||
+                                   callee->getName().equals("__kmpc_end_critical")) {
+                            Value *lock = callInst->getArgOperand(2);
+                            if (critLocks.find(lock) == critLocks.end())
+                                critLocks.insert(lock);
+                        }
+                    }
+            }
+            errs() << "Number of omp_lock_t locks detected: " << explicitLocks.size() << '\n';
+            errs() << "Number of different critical sections detected: " << critLocks.size() << '\n';
             // TODO
 
             // compute happen-before relation
             // TODO
 
-            AAQueryInfo AAQI = AAQueryInfo();
-            auto &baa = getAnalysis<BasicAAWrapperPass>().getResult();
-            auto &snaaa = getAnalysis<ScopedNoAliasAAWrapperPass>().getResult();
-            auto &tbaa = getAnalysis<TypeBasedAAWrapperPass>().getResult();
-            auto &gaa = getAnalysis<GlobalsAAWrapperPass>().getResult();
-            auto &scevaa = getAnalysis<SCEVAAWrapperPass>().getResult();
-            auto &cflaaa = getAnalysis<CFLAndersAAWrapperPass>().getResult();
-            auto &cflsaa = getAnalysis<CFLSteensAAWrapperPass>().getResult();
 
             // TODO: access with atomicrmw should ignore lock set. They are generated with #pragma omp atomic
 
+            errs() << '\n';
             return false;
         }
 
         AliasResult getAliasResult(
-            const MemoryLocation &A, const MemoryLocation &B,
-            AAQueryInfo &AAQI,
-            BasicAAResult &baa,
-            ScopedNoAliasAAResult &snaaa,
-            TypeBasedAAResult &tbaa,
-            GlobalsAAResult &gaa,
-            SCEVAAResult &scevaa,
-            CFLAndersAAResult &cflaaa,
-            CFLSteensAAResult &cflsaa
+                const MemoryLocation &A, const MemoryLocation &B,
+                AAQueryInfo &AAQI,
+                BasicAAResult &baa,
+                ScopedNoAliasAAResult &snaaa,
+                TypeBasedAAResult &tbaa,
+                GlobalsAAResult &gaa,
+                SCEVAAResult &scevaa,
+                CFLAndersAAResult &cflaaa,
+                CFLSteensAAResult &cflsaa
         ) {
             AAQueryInfo::LocPair Locs(A, B);
 
@@ -153,13 +186,13 @@ namespace {
             for (auto &R : results) {
                 if (R == PartialAlias) {
                     AAQI.AliasCache.insert(make_pair(Locs, R));
-                    return R; 
+                    return R;
                 }
             }
             for (auto &R : results) {
                 if (R == NoAlias) {
                     AAQI.AliasCache.insert(make_pair(Locs, R));
-                    return R; 
+                    return R;
                 }
             }
             return MayAlias;
