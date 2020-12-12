@@ -157,12 +157,12 @@ namespace {
                 }
             }
             for (auto &R : results) {
-                if (R == MayAlias) {
+                if (R == NoAlias) {
                     AAQI.AliasCache.insert(make_pair(Locs, R));
                     return R; 
                 }
             }
-            return NoAlias;
+            return MayAlias;
         }
 
         static char ID;
