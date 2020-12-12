@@ -11,10 +11,24 @@
 #include "llvm/Analysis/CFLSteensAliasAnalysis.h"
 #include "llvm/IR/Instruction.def"
 #include "llvm/Support/Format.h"
+#include "llvm/IR/CFG.h"
+
+#include <vector>
+#include <unordered_map>
 
 using namespace llvm;
+using namespace std;
 
 namespace {
+    struct Segment {
+        BasicBlock *parent = nullptr;
+        vector<Instruction *> instructions;
+        vector<Segment *> pred, succ;
+    };
+
+    // we need this to compute lock set
+    unordered_map<BasicBlock *, vector<Segment *>> mapBB2Seg;
+
     struct OMPRacePass : public llvm::FunctionPass {
         bool runOnFunction(llvm::Function &F) override {
             if (!F.getName().startswith(".omp_outlined."))
@@ -24,17 +38,62 @@ namespace {
 
             // form segments
             for (auto &bb: F) {
+                Segment *curSeg = nullptr;
                 for (auto &op: bb) {
-                    if (op.isTerminator())
-                        break; // next BB
-                    else if (op.getOpcode() == Instruction::Call) {
+                    if (curSeg == nullptr) {
+                        curSeg = new Segment();
+                        curSeg->parent = &bb;
+                        // we compute the predecessors after we are done with all BBs
+                        mapBB2Seg[&bb].push_back(curSeg);
+                    }
+                    curSeg->instructions.push_back(&op);
+                    if (op.isTerminator()) {
+                        // BB terminating. Finish current segment.
+                        // we compute the successors after we are done with all BBs
+                        mapBB2Seg[&bb].push_back(curSeg);
+                        break;
+                    }
+
+                    if (op.getOpcode() == Instruction::Call) {
                         auto *callee = op.getOperand(op.getNumOperands() - 1);
                         assert(callee->getType()->isPointerTy() &&
                                "call op's last argument should be a ptr to function");
                         errs() << "callee name: " << callee->getName() << '\n';
+
+                        if (callee->getName().equals("omp_set_lock") ||
+                            callee->getName().equals("omp_unset_lock") ||
+                            callee->getName().equals("__kmpc_critical") ||
+                            callee->getName().equals("__kmpc_end_critical")) {
+                            // syncing operations, start new segment and chain it with prev segment
+                            auto *newSeg = new Segment();
+                            newSeg->parent = &bb;
+                            newSeg->pred.push_back(curSeg);
+                            curSeg->succ.push_back(newSeg);
+                            curSeg = newSeg;
+                            mapBB2Seg[&bb].push_back(curSeg);
+                        }
                     }
                 }
             }
+
+            // fill segments' predecessor/successor info
+            for (auto &bb: F) {
+                // first segment so predecessors are ending segments of BB's predecessor BBs.
+                Segment *first = mapBB2Seg[&bb].front();
+                for (auto *pred: predecessors(&bb))
+                    first->pred.push_back(mapBB2Seg[pred].back());
+
+                // ending segment so successors are first segments of BB's successor BBs.
+                Segment *last = mapBB2Seg[&bb].back();
+                for (auto *succ: successors(&bb))
+                    first->pred.push_back(mapBB2Seg[succ].front());
+            }
+
+            // compute the lock set
+            // TODO
+
+            // compute happen-before relation
+            // TODO
 
             auto &baa = getAnalysis<BasicAAWrapperPass>().getResult();
             auto &snaaa = getAnalysis<ScopedNoAliasAAWrapperPass>().getResult();
@@ -43,6 +102,8 @@ namespace {
             auto &scevaa = getAnalysis<SCEVAAWrapperPass>().getResult();
             auto &cflaaa = getAnalysis<CFLAndersAAWrapperPass>().getResult();
             auto &cflsaa = getAnalysis<CFLSteensAAWrapperPass>().getResult();
+
+            // TODO: access with atomicrmw should ignore lock set. They are generated with #pragma omp atomic
 
             return false;
         }
@@ -55,8 +116,6 @@ namespace {
             usage.setPreservesAll();
 
             usage.addRequired<BasicAAWrapperPass>();
-            // usage.addRequired<TargetLibraryInfoWrapperPass>();
-
             usage.addRequired<ScopedNoAliasAAWrapperPass>();
             usage.addRequired<TypeBasedAAWrapperPass>();
             usage.addRequired<GlobalsAAWrapperPass>();

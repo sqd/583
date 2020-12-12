@@ -2,9 +2,13 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+void do_other_thing() {
+
+}
+
 int main() {
     omp_lock_t lock;
-    int* i = malloc(4);
+    int* const i = malloc(4);
 #pragma omp parallel
     while(1)
     {
@@ -17,4 +21,6 @@ int main() {
             omp_unset_lock(&lock);
         }
     }
+#pragma omp parallel
+    do_other_thing();
 }
