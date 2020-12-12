@@ -28,7 +28,7 @@ namespace {
 
     // we need this to compute lock set
     unordered_map<BasicBlock *, vector<Segment *>> mapBB2Seg;
-
+    
     struct OMPRacePass : public llvm::FunctionPass {
         bool runOnFunction(llvm::Function &F) override {
             if (!F.getName().startswith(".omp_outlined."))
@@ -95,6 +95,7 @@ namespace {
             // compute happen-before relation
             // TODO
 
+            AAQueryInfo AAQI = AAQueryInfo();
             auto &baa = getAnalysis<BasicAAWrapperPass>().getResult();
             auto &snaaa = getAnalysis<ScopedNoAliasAAWrapperPass>().getResult();
             auto &tbaa = getAnalysis<TypeBasedAAWrapperPass>().getResult();
@@ -106,6 +107,62 @@ namespace {
             // TODO: access with atomicrmw should ignore lock set. They are generated with #pragma omp atomic
 
             return false;
+        }
+
+        AliasResult getAliasResult(
+            const MemoryLocation &A, const MemoryLocation &B,
+            AAQueryInfo &AAQI,
+            BasicAAResult &baa,
+            ScopedNoAliasAAResult &snaaa,
+            TypeBasedAAResult &tbaa,
+            GlobalsAAResult &gaa,
+            SCEVAAResult &scevaa,
+            CFLAndersAAResult &cflaaa,
+            CFLSteensAAResult &cflsaa
+        ) {
+            AAQueryInfo::LocPair Locs(A, B);
+
+            // Return cached alias result if it exists
+            auto hit = AAQI.AliasCache.find(Locs);
+            if (hit != AAQI.AliasCache.end()) {
+                return hit->second;
+            }
+            // Go through all passes and cache strictest alias result
+            vector<AliasResult> results;
+            auto I = AAQueryInfo();
+            results.push_back(baa.alias(A, B, I));
+            I = AAQueryInfo();
+            results.push_back(snaaa.alias(A, B, I));
+            I = AAQueryInfo();
+            results.push_back(tbaa.alias(A, B, I));
+            I = AAQueryInfo();
+            results.push_back(gaa.alias(A, B, I));
+            I = AAQueryInfo();
+            results.push_back(scevaa.alias(A, B, I));
+            I = AAQueryInfo();
+            results.push_back(cflaaa.alias(A, B, I));
+            I = AAQueryInfo();
+            results.push_back(cflsaa.alias(A, B, I));
+
+            for (auto &R : results) {
+                if (R == MustAlias) {
+                    AAQI.AliasCache.insert(make_pair(Locs, R));
+                    return R;
+                }
+            }
+            for (auto &R : results) {
+                if (R == PartialAlias) {
+                    AAQI.AliasCache.insert(make_pair(Locs, R));
+                    return R; 
+                }
+            }
+            for (auto &R : results) {
+                if (R == MayAlias) {
+                    AAQI.AliasCache.insert(make_pair(Locs, R));
+                    return R; 
+                }
+            }
+            return NoAlias;
         }
 
         static char ID;
