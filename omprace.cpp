@@ -68,8 +68,15 @@ struct Segment {
     vector<Instruction *> instructions;
     vector<Segment *> pred, succ;
     unordered_set<Lock> lockSet;
+
+    unordered_set<Lock> outSet;
 };
 
+template<typename T>
+void unionWith(unordered_set<T> &target, const unordered_set<T> &with) {
+    for (const T &t: with)
+        target.insert(t);
+}
 
 namespace {
     struct AASummary {
@@ -154,23 +161,43 @@ namespace {
         }
     }
 
-    void dfsLockSet(Segment *seg) {
+    bool updateLockSet(Segment *seg, unordered_set<Lock> allLocks, AASummary &aas) {
+        for (Segment *pred: seg->pred)
+            unionWith(seg->lockSet, pred->outSet);
+        seg->outSet = seg->lockSet;
+
         Instruction *endOp = seg->instructions.back();
         if (endOp->isTerminator()) {
             // this segment ends naturally, nothing is killed/generated
-            // TODO
+            return false;
         } else {
             // this segment ends because of a syncing operation
             // which is a function call
             auto *callInst = dyn_cast<CallInst>(endOp);
-            assert(callInst != nullptr &&
-                   "Segment's last instruction is neither a terminator nor a syncing function call");
             Function *callee = callInst->getCalledFunction();
             if (callee->getName().equals("omp_set_lock")) {
+                // gen a new lock
+                MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
+                Lock newLock = *findLockIn(Lock(memLoc), allLocks, aas);
+                seg->outSet.insert(newLock);
             } else if (callee->getName().equals("omp_unset_lock")) {
+                // kill a lock
+                MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
+                Lock deadLock = *findLockIn(Lock(memLoc), allLocks, aas);
+                seg->outSet.erase(deadLock);
             } else if (callee->getName().equals("__kmpc_critical")) {
+                // gen a new lock
+                Value *critLock = callInst->getArgOperand(2);
+                Lock newLock = *findLockIn(Lock(critLock), allLocks, aas);
+                seg->outSet.insert(newLock);
             } else if (callee->getName().equals("__kmpc_end_critical")) {
+                // kill a lock
+                Value *critLock = callInst->getArgOperand(2);
+                Lock deadLock = *findLockIn(Lock(critLock), allLocks, aas);
+                seg->outSet.erase(deadLock);
             }
+
+            return true;
         }
     }
 
@@ -194,11 +221,12 @@ namespace {
             unordered_map<BasicBlock *, vector<Segment *>> mapBB2Seg;
 
             // form segments
+            unordered_set<Segment *> allSegs;
             for (auto &bb: F) {
                 Segment *curSeg = nullptr;
                 for (auto &op: bb) {
                     if (curSeg == nullptr) {
-                        curSeg = new Segment();
+                        allSegs.insert(curSeg = new Segment());
                         curSeg->parent = &bb;
                         // we compute the predecessors after we are done with all BBs
                         mapBB2Seg[&bb].push_back(curSeg);
@@ -217,8 +245,10 @@ namespace {
                             callee->getName().equals("omp_unset_lock") ||
                             callee->getName().equals("__kmpc_critical") ||
                             callee->getName().equals("__kmpc_end_critical")) {
+
                             // syncing operations, start new segment and chain it with prev segment
                             auto *newSeg = new Segment();
+                            allSegs.insert(newSeg);
                             newSeg->parent = &bb;
                             newSeg->pred.push_back(curSeg);
                             curSeg->succ.push_back(newSeg);
@@ -254,24 +284,26 @@ namespace {
 
                             MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                             // is this a new lock?
-                            auto it = findLockIn(Lock(memLoc), allLocks, aas);
-                            if (it == allLocks.end())
+                            if (findLockIn(Lock(memLoc), allLocks, aas) == allLocks.end())
                                 allLocks.emplace(memLoc);
                         } else if (callee->getName().equals("__kmpc_critical") ||
                                    callee->getName().equals("__kmpc_end_critical")) {
+
                             Value *critLock = callInst->getArgOperand(2);
-                            if (allLocks.find(Lock(critLock)) == allLocks.end())
+                            // is this a new lock?
+                            if (findLockIn(Lock(critLock), allLocks, aas) == allLocks.end())
                                 allLocks.emplace(critLock);
                         }
                     }
             }
             errs() << "Number of locks detected: " << allLocks.size() << '\n';
             // now we have all the locks, we actually compute the lock set with a general DFA
-            // TODO: do multiple pass
-            Segment *headSeg = mapBB2Seg[&F.getEntryBlock()].front();
-            dfsLockSet(headSeg);
-
-            // TODO
+            bool updated = true;
+            while (updated) {
+                updated = false;
+                for (Segment *seg: allSegs)
+                    updated = updated || updateLockSet(seg, allLocks, aas);
+            }
 
             // compute happen-before relation
             // TODO
