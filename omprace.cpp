@@ -70,6 +70,13 @@ struct Segment {
     unordered_set<Lock> lockSet;
 
     unordered_set<Lock> outSet;
+
+    void dump() {
+        parent->printAsOperand(errs(), false);
+        errs() << '\n';
+        for (Instruction *op: instructions)
+            errs() << *op << '\n';
+    }
 };
 
 template<typename T>
@@ -162,6 +169,7 @@ namespace {
     }
 
     bool updateLockSet(Segment *seg, unordered_set<Lock> allLocks, AASummary &aas) {
+        seg->lockSet.clear();
         for (Segment *pred: seg->pred)
             unionWith(seg->lockSet, pred->outSet);
         seg->outSet = seg->lockSet;
@@ -179,25 +187,39 @@ namespace {
                 // gen a new lock
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock newLock = *findLockIn(Lock(memLoc), allLocks, aas);
-                seg->outSet.insert(newLock);
+                if (seg->outSet.find(newLock) == seg->outSet.end()) {
+                    seg->outSet.insert(newLock);
+                    return true;
+                }
             } else if (callee->getName().equals("omp_unset_lock")) {
                 // kill a lock
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock deadLock = *findLockIn(Lock(memLoc), allLocks, aas);
-                seg->outSet.erase(deadLock);
+                if (seg->outSet.find(deadLock) != seg->outSet.end()) {
+                    seg->outSet.erase(deadLock);
+                    return true;
+                }
             } else if (callee->getName().equals("__kmpc_critical")) {
                 // gen a new lock
                 Value *critLock = callInst->getArgOperand(2);
                 Lock newLock = *findLockIn(Lock(critLock), allLocks, aas);
-                seg->outSet.insert(newLock);
+                if (seg->outSet.find(newLock) == seg->outSet.end()) {
+                    seg->outSet.insert(newLock);
+                    return true;
+                }
             } else if (callee->getName().equals("__kmpc_end_critical")) {
                 // kill a lock
                 Value *critLock = callInst->getArgOperand(2);
                 Lock deadLock = *findLockIn(Lock(critLock), allLocks, aas);
-                seg->outSet.erase(deadLock);
+                if (seg->outSet.find(deadLock) != seg->outSet.end()) {
+                    seg->outSet.erase(deadLock);
+                    return true;
+                }
+            } else {
+                assert(false);
             }
 
-            return true;
+            return false;
         }
     }
 
@@ -226,16 +248,16 @@ namespace {
                 Segment *curSeg = nullptr;
                 for (auto &op: bb) {
                     if (curSeg == nullptr) {
-                        allSegs.insert(curSeg = new Segment());
+                        curSeg = new Segment();
+                        allSegs.insert(curSeg);
                         curSeg->parent = &bb;
                         // we compute the predecessors after we are done with all BBs
                         mapBB2Seg[&bb].push_back(curSeg);
                     }
                     curSeg->instructions.push_back(&op);
                     if (op.isTerminator()) {
-                        // BB terminating. Finish current segment.
+                        // BB terminating. Stop processing current segment.
                         // we compute the successors after we are done with all BBs
-                        mapBB2Seg[&bb].push_back(curSeg);
                         break;
                     }
 
@@ -246,12 +268,10 @@ namespace {
                             callee->getName().equals("__kmpc_critical") ||
                             callee->getName().equals("__kmpc_end_critical")) {
 
-                            // syncing operations, start new segment and chain it with prev segment
+                            // syncing operations, start a new segment
                             auto *newSeg = new Segment();
                             allSegs.insert(newSeg);
                             newSeg->parent = &bb;
-                            newSeg->pred.push_back(curSeg);
-                            curSeg->succ.push_back(newSeg);
                             curSeg = newSeg;
                             mapBB2Seg[&bb].push_back(curSeg);
                         }
@@ -263,13 +283,43 @@ namespace {
             for (auto &bb: F) {
                 // first segment so predecessors are ending segments of BB's predecessor BBs.
                 Segment *first = mapBB2Seg[&bb].front();
-                for (auto *pred: predecessors(&bb))
-                    first->pred.push_back(mapBB2Seg[pred].back());
+                for (auto *predBB: predecessors(&bb))
+                    first->pred.push_back(mapBB2Seg[predBB].back());
 
                 // ending segment so successors are first segments of BB's successor BBs.
                 Segment *last = mapBB2Seg[&bb].back();
-                for (auto *succ: successors(&bb))
-                    first->pred.push_back(mapBB2Seg[succ].front());
+                for (auto *succBB: successors(&bb))
+                    last->succ.push_back(mapBB2Seg[succBB].front());
+
+                // pred/succ inside BB
+                vector<Segment *> &segOfBB = mapBB2Seg[&bb];
+                for (auto it = segOfBB.begin(); it != segOfBB.end() && it + 1 != segOfBB.end(); it++) {
+                    auto next = it + 1;
+                    (*it)->succ.push_back(*next);
+                    (*next)->pred.push_back(*it);
+                }
+            }
+
+            for (BasicBlock &bb: F) {
+                bb.printAsOperand(errs(), false);
+                errs() << '\n';
+                for (Segment *seg: mapBB2Seg[&bb]) {
+                    seg->dump();
+                    errs() << "pred: " << seg->pred.size() << ' ';
+                    for (Segment *pred: seg->pred) {
+                        pred->parent->printAsOperand(errs(), false);
+                        errs() << ' ';
+                    }
+                    errs() << '\n';
+                    errs() << "succ: " << seg->succ.size() << ' ';
+                    for (Segment *succ: seg->succ) {
+                        succ->parent->printAsOperand(errs(), false);
+                        errs() << ' ';
+                    }
+                    errs() << '\n';
+                    errs() << "            -----------------------------------------------------------------\n";
+                }
+                errs() << "=============================================================================\n";
             }
 
             // compute the lock set
@@ -297,6 +347,8 @@ namespace {
                     }
             }
             errs() << "Number of locks detected: " << allLocks.size() << '\n';
+
+
             // now we have all the locks, we actually compute the lock set with a general DFA
             bool updated = true;
             while (updated) {
