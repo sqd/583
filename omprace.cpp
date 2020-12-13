@@ -42,8 +42,10 @@ struct Lock {
                 return value.explicitLock == other.value.explicitLock;
             case Lock::CriticalSectionLock:
                 return value.criticalSectionLock == other.value.criticalSectionLock;
+            default:
+                assert(false && "Type not considered");
+                return false; // to appease the totality god
         }
-        assert(false && "Type not considered");
     }
 };
 
@@ -172,6 +174,7 @@ namespace {
         seg->lockSet.clear();
         for (Segment *pred: seg->pred)
             unionWith(seg->lockSet, pred->outSet);
+        unordered_set<Lock> oldOutSeg = std::move(seg->outSet);
         seg->outSet = seg->lockSet;
 
         Instruction *endOp = seg->instructions.back();
@@ -187,39 +190,29 @@ namespace {
                 // gen a new lock
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock newLock = *findLockIn(Lock(memLoc), allLocks, aas);
-                if (seg->outSet.find(newLock) == seg->outSet.end()) {
-                    seg->outSet.insert(newLock);
-                    return true;
-                }
+                seg->outSet.insert(newLock);
+                return seg->outSet != oldOutSeg;
             } else if (callee->getName().equals("omp_unset_lock")) {
                 // kill a lock
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock deadLock = *findLockIn(Lock(memLoc), allLocks, aas);
-                if (seg->outSet.find(deadLock) != seg->outSet.end()) {
-                    seg->outSet.erase(deadLock);
-                    return true;
-                }
+                seg->outSet.erase(deadLock);
+                return seg->outSet != oldOutSeg;
             } else if (callee->getName().equals("__kmpc_critical")) {
                 // gen a new lock
                 Value *critLock = callInst->getArgOperand(2);
                 Lock newLock = *findLockIn(Lock(critLock), allLocks, aas);
-                if (seg->outSet.find(newLock) == seg->outSet.end()) {
-                    seg->outSet.insert(newLock);
-                    return true;
-                }
+                seg->outSet.insert(newLock);
+                return seg->outSet != oldOutSeg;
             } else if (callee->getName().equals("__kmpc_end_critical")) {
                 // kill a lock
                 Value *critLock = callInst->getArgOperand(2);
                 Lock deadLock = *findLockIn(Lock(critLock), allLocks, aas);
-                if (seg->outSet.find(deadLock) != seg->outSet.end()) {
-                    seg->outSet.erase(deadLock);
-                    return true;
-                }
+                seg->outSet.erase(deadLock);
+                return seg->outSet != oldOutSeg;
             } else {
                 assert(false);
             }
-
-            return false;
         }
     }
 
@@ -300,6 +293,7 @@ namespace {
                 }
             }
 
+#ifdef VERBOSE_DEBUG
             for (BasicBlock &bb: F) {
                 bb.printAsOperand(errs(), false);
                 errs() << '\n';
@@ -321,6 +315,7 @@ namespace {
                 }
                 errs() << "=============================================================================\n";
             }
+#endif
 
             // compute the lock set
             // first, we make a list of all the locks
@@ -350,6 +345,29 @@ namespace {
 
 
             // now we have all the locks, we actually compute the lock set with a general DFA
+#ifdef VERBOSE_DEBUG
+            for (int i = 0; i < 5; i++) {
+                bool updated = false;
+                errs() << "\n\niter " << i << "\n";
+                for (Segment *seg: allSegs)
+                    if (updateLockSet(seg, allLocks, aas)) {
+                        errs() << ".........\n";
+                        seg->dump();
+                        errs() << "\n.........\n";
+                        updated = true;
+                    }
+                for (Segment *seg: allSegs) {
+                    seg->dump();
+                    if (!seg->lockSet.empty())
+                        errs() << "!!!!!!!" << seg->lockSet.size() << "\n";
+                    if (!seg->outSet.empty())
+                        errs() << "???????" << seg->outSet.size() << "\n";
+                    errs() << '\n';
+                }
+                if (!updated)
+                    break;
+            }
+#endif
             bool updated = true;
             while (updated) {
                 updated = false;
