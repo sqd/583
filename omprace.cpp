@@ -164,14 +164,40 @@ void outputDILocationLine(DILocation *dil) {
     errs() << dil->getLine() << '\n';
 }
 
-bool detectRace(Instruction *A, Instruction *B, AASummary &aas) {
+template<typename C>
+typename C::iterator findLockIn(const Lock &target, C &lockSet, AASummary &aas) {
+    switch (target.type) {
+        case Lock::ExplicitLock:
+            return find_if(lockSet.begin(), lockSet.end(),
+                           [&](const Lock &lock) {
+                               if (lock.type != target.type)
+                                   return false;
+                               AliasResult aliasResult
+                                       = aas.alias(target.value.explicitLock, lock.value.explicitLock);
+                               return aliasResult == MustAlias ||
+                                      aliasResult == PartialAlias;
+                           });
+        case Lock::CriticalSectionLock:
+            return find_if(lockSet.begin(), lockSet.end(),
+                           [&](const Lock &lock) {
+                               if (lock.type != target.type)
+                                   return false;
+                               return lock.value.criticalSectionLock == target.value.criticalSectionLock;
+                           });
+        default:
+            assert(false);
+    }
+}
+
+bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lock> &allLocks) {
     auto codeA = A->getOpcode(), codeB = B->getOpcode();
     switch ((codeA << 16u) | codeB) {
         case (Instruction::Store << 16u) | Instruction::Store:
         case (Instruction::Store << 16u) | Instruction::Load:
         case (Instruction::Load << 16u) | Instruction::Store: {
             AliasResult result = aas.alias(MemoryLocation::get(A), MemoryLocation::get(B));
-            if (result == PartialAlias || result == MustAlias) {
+            if ((result == PartialAlias || result == MustAlias) &&
+                findLockIn(Lock(MemoryLocation::get(A)), allLocks, aas) == allLocks.end()) {
                 errs() << "data race:\n" << *A << '\n' << *B << '\n';
                 return true;
             }
@@ -182,32 +208,6 @@ bool detectRace(Instruction *A, Instruction *B, AASummary &aas) {
 }
 
 namespace {
-
-    template<typename C>
-    typename C::iterator findLockIn(const Lock &target, C &lockSet, AASummary &aas) {
-        switch (target.type) {
-            case Lock::ExplicitLock:
-                return find_if(lockSet.begin(), lockSet.end(),
-                               [&](const Lock &lock) {
-                                   if (lock.type != target.type)
-                                       return false;
-                                   AliasResult aliasResult
-                                           = aas.alias(target.value.explicitLock, lock.value.explicitLock);
-                                   return aliasResult == MustAlias ||
-                                          aliasResult == PartialAlias;
-                               });
-            case Lock::CriticalSectionLock:
-                return find_if(lockSet.begin(), lockSet.end(),
-                               [&](const Lock &lock) {
-                                   if (lock.type != target.type)
-                                       return false;
-                                   return lock.value.criticalSectionLock == target.value.criticalSectionLock;
-                               });
-            default:
-                assert(false);
-        }
-    }
-
     bool updateLockSet(Segment *seg, unordered_set<Lock> allLocks, AASummary &aas) {
         seg->lockSet.clear();
         for (Segment *pred: seg->pred)
@@ -501,12 +501,13 @@ namespace {
             // detect race!
             for (Segment *A: allSegs)
                 for (Segment *B: allSegs)
-                    if (A->happensBefore.find(B) == A->happensBefore.end() &&
+                    if (A != B &&
+                        A->happensBefore.find(B) == A->happensBefore.end() &&
                         B->happensBefore.find(A) == B->happensBefore.end() &&
                         !intersect(A->lockSet, B->lockSet)) {
                         for (Instruction *opA: A->instructions)
                             for (Instruction *opB: B->instructions)
-                                detectRace(opA, opB, aas);
+                                detectRace(opA, opB, aas, allLocks);
                     }
 
             errs() << '\n';
