@@ -189,7 +189,7 @@ void printDatarace(Instruction *A, Instruction *B) {
     if (B != A) {
         printDebugLoc(B->getDebugLoc());
         B->getParent()->printAsOperand(errs(), false);
-        errs() << "(" << getInstructionIndex(A) << "): " << *A << '\n';
+        errs() << "(" << getInstructionIndex(A) << "): " << *B << '\n';
     } else
         errs() << "and itself in another thread\n";
 }
@@ -221,20 +221,18 @@ typename C::iterator findLockIn(const Lock &target, C &lockSet, AASummary &aas) 
 
 bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lock> &allLocks) {
     auto codeA = A->getOpcode(), codeB = B->getOpcode();
-    switch ((codeA << 16u) | codeB) {
-        case (Instruction::Store << 16u) | Instruction::Store:
-        case (Instruction::Store << 16u) | Instruction::Load:
-        case (Instruction::Load << 16u) | Instruction::Store: {
-            AliasResult result = aas.alias(MemoryLocation::get(A), MemoryLocation::get(B));
-            if ((result == PartialAlias || result == MustAlias) &&
-                findLockIn(Lock(MemoryLocation::get(A)), allLocks, aas) == allLocks.end()) {
-                printDatarace(A, B);
-                return true;
-            }
+    if ((codeA == Instruction::Store && codeB == Instruction::Load) ||
+        (codeA == Instruction::Load && codeB == Instruction::Store) ||
+        (codeA == Instruction::Store && codeB == Instruction::Store)) {
+
+        AliasResult result = aas.alias(MemoryLocation::get(A), MemoryLocation::get(B));
+        if ((result == PartialAlias || result == MustAlias) &&
+            findLockIn(Lock(MemoryLocation::get(A)), allLocks, aas) == allLocks.end()) {
+            printDatarace(A, B);
+            return true;
         }
-        default:
-            return false;
     }
+    return false;
 }
 
 namespace {
