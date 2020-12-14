@@ -70,6 +70,7 @@ struct Segment {
     vector<Instruction *> instructions;
     vector<Segment *> pred, succ;
     unordered_set<Lock> lockSet;
+    unordered_set<Segment *> happensBefore;
 
     unordered_set<Lock> outSet;
 
@@ -81,8 +82,8 @@ struct Segment {
     }
 };
 
-template<typename T>
-void unionWith(unordered_set<T> &target, const unordered_set<T> &with) {
+template<typename T, typename C>
+void unionWith(unordered_set<T> &target, const C &with) {
     for (const T &t: with)
         target.insert(t);
 }
@@ -186,13 +187,15 @@ namespace {
             // which is a function call
             auto *callInst = dyn_cast<CallInst>(endOp);
             Function *callee = callInst->getCalledFunction();
-            if (callee->getName().equals("omp_set_lock")) {
+            if (callee->getName().equals("omp_set_lock") ||
+                callee->getName().equals("pthread_mutex_lock")) {
                 // gen a new lock
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock newLock = *findLockIn(Lock(memLoc), allLocks, aas);
                 seg->outSet.insert(newLock);
                 return seg->outSet != oldOutSeg;
-            } else if (callee->getName().equals("omp_unset_lock")) {
+            } else if (callee->getName().equals("omp_unset_lock") ||
+                       callee->getName().equals("pthread_mutex_unlock")) {
                 // kill a lock
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock deadLock = *findLockIn(Lock(memLoc), allLocks, aas);
@@ -210,10 +213,16 @@ namespace {
                 Lock deadLock = *findLockIn(Lock(critLock), allLocks, aas);
                 seg->outSet.erase(deadLock);
                 return seg->outSet != oldOutSeg;
-            } else {
-                assert(false);
+            } else if (callee->getName().equals("pthread_cond_wait")) {
+                // cv.wait() also kill a lock
+                // but cv.signal()/broadcast() does not
+                Value *critLock = callInst->getArgOperand(1);
+                Lock deadLock = *findLockIn(Lock(critLock), allLocks, aas);
+                seg->outSet.erase(deadLock);
+                return seg->outSet != oldOutSeg;
             }
         }
+        return false;
     }
 
     struct OMPRacePass : public llvm::FunctionPass {
@@ -259,7 +268,12 @@ namespace {
                         if (callee->getName().equals("omp_set_lock") ||
                             callee->getName().equals("omp_unset_lock") ||
                             callee->getName().equals("__kmpc_critical") ||
-                            callee->getName().equals("__kmpc_end_critical")) {
+                            callee->getName().equals("__kmpc_end_critical") ||
+                            callee->getName().equals("pthread_mutex_lock") ||
+                            callee->getName().equals("pthread_mutex_unlock") ||
+                            callee->getName().equals("pthread_cond_wait") ||
+                            callee->getName().equals("pthread_cond_signal") ||
+                            callee->getName().equals("__kmpc_barrier")) {
 
                             // syncing operations, start a new segment
                             auto *newSeg = new Segment();
@@ -318,14 +332,17 @@ namespace {
 #endif
 
             // compute the lock set
-            // first, we make a list of all the locks
-            unordered_set<Lock> allLocks;
+            // first, we make a canonical list of all the locks and cvs
+            // we use the same infrastructure (memory-location-based lock) for CVs
+            unordered_set<Lock> allLocks, allCVs;
             for (auto &bb: F) {
                 for (auto &op: bb)
                     if (auto *callInst = dyn_cast<CallInst>(&op)) {
                         Function *callee = callInst->getCalledFunction();
                         if (callee->getName().equals("omp_set_lock") ||
-                            callee->getName().equals("omp_unset_lock")) {
+                            callee->getName().equals("omp_unset_lock") ||
+                            callee->getName().equals("pthread_mutex_lock") ||
+                            callee->getName().equals("pthread_mutex_unlock")) {
 
                             MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                             // is this a new lock?
@@ -338,15 +355,31 @@ namespace {
                             // is this a new lock?
                             if (findLockIn(Lock(critLock), allLocks, aas) == allLocks.end())
                                 allLocks.emplace(critLock);
+                        } else if (callee->getName().equals("pthread_cond_wait") ||
+                                   callee->getName().equals("pthread_cond_signal") ||
+                                   callee->getName().equals("pthread_cond_broadcast")) {
+                            if (callee->getName().equals("pthread_cond_wait")) {
+                                // this could also introduce a lock not seen before
+                                MemoryLocation memLoc = MemoryLocation::get(
+                                        dyn_cast<LoadInst>(callInst->getArgOperand(1)));
+                                // is this a new lock?
+                                if (findLockIn(Lock(memLoc), allLocks, aas) == allLocks.end())
+                                    allLocks.emplace(memLoc);
+                            }
+                            // keeping tab of CVs
+                            MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
+                            // is this a new CV?
+                            if (findLockIn(Lock(memLoc), allCVs, aas) == allCVs.end())
+                                allCVs.emplace(memLoc);
                         }
                     }
             }
+
             errs() << "Number of locks detected: " << allLocks.size() << '\n';
-
-
-            // now we have all the locks, we actually compute the lock set with a general DFA
+            errs() << "Number of CVs detected: " << allCVs.size() << '\n';
+            // now we have all the locks canonically, we actually compute the lock set with a general DFA
 #ifdef VERBOSE_DEBUG
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 3; i++) {
                 bool updated = false;
                 errs() << "\n\niter " << i << "\n";
                 for (Segment *seg: allSegs)
@@ -374,22 +407,71 @@ namespace {
                 for (Segment *seg: allSegs)
                     updated = updated || updateLockSet(seg, allLocks, aas);
             }
+            // clear outSet since we no longer need it
+            for (Segment *seg: allSegs)
+                seg->outSet.clear();
 
-            // compute happen-before relation
-            // TODO
+            // compute happen-before relations
+            for (auto &bb: F) {
+                for (Segment *seg: allSegs)
+                    if (auto *callInst = dyn_cast<CallInst>(seg->instructions.back())) {
+                        StringRef calledFuncName = callInst->getCalledFunction()->getName();
+                        // 1. barrier happen-before
+                        if (calledFuncName.equals("__kmpc_barrier")) {
+                            // this segment happens before all of its successors
+                            unionWith(seg->happensBefore, seg->succ);
+                        } // 2. cv happen before
+                        else if (calledFuncName.equals("pthread_cond_signal") ||
+                                 calledFuncName.equals("pthread_cond_broadcast")) {
+                            for (Segment *waitSeg: allSegs) {
+                                if (auto *waitCallInst = dyn_cast<CallInst>(waitSeg->instructions.back())) {
+                                    if (waitCallInst->getCalledFunction()->getName().equals("pthread_cond_wait")) {
+                                        AliasResult ar = aas.alias(
+                                                MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0))),
+                                                MemoryLocation::get(dyn_cast<LoadInst>(waitCallInst->getArgOperand(0)))
+                                        );
+                                        if (ar == MustAlias ||
+                                            ar == PartialAlias) {
+                                            // signal/broadcaster happens before the successors of waiter
+                                            for (Segment *succ: waitSeg->succ)
+                                                succ->happensBefore.insert(seg);
+                                        }
 
+                                    }
+                                }
+                            }
+                        }
+
+                    }
+            }
+            // happen-before relation is transitive
+            updated = true;
+            while (updated) {
+                updated = false;
+                for (Segment *seg: allSegs)
+                    for (Segment *after: seg->happensBefore)
+                        for (Segment *afterAfter: after->happensBefore)
+                            if (seg->happensBefore.find(afterAfter) == seg->happensBefore.end()) {
+                                seg->happensBefore.insert(afterAfter);
+                                updated = true;
+                            }
+            }
+
+            // TODO think about what happen-before relations are nullified by back-edge
 
             // TODO: access with atomicrmw should ignore lock set. They are generated with #pragma omp atomic
 
             errs() << '\n';
             return false;
+
         }
 
         static char ID;
 
         OMPRacePass() : FunctionPass(ID) {}
 
-        void getAnalysisUsage(AnalysisUsage &usage) const override {
+        void getAnalysisUsage(AnalysisUsage &usage) const
+        override {
             usage.setPreservesAll();
 
             usage.addRequired<BasicAAWrapperPass>();
@@ -406,4 +488,6 @@ namespace {
 }
 
 
-static RegisterPass<OMPRacePass> reg("omprace", "OpenMP race condition detector", true, true);
+static RegisterPass<OMPRacePass>
+
+        reg("omprace", "OpenMP race condition detector", true, true);
