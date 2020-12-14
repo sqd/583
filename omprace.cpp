@@ -501,8 +501,7 @@ namespace {
             // detect race!
             for (Segment *A: allSegs)
                 for (Segment *B: allSegs)
-                    if (A != B &&
-                        A->happensBefore.find(B) == A->happensBefore.end() &&
+                    if (A->happensBefore.find(B) == A->happensBefore.end() &&
                         B->happensBefore.find(A) == B->happensBefore.end() &&
                         !intersect(A->lockSet, B->lockSet)) {
                         for (Instruction *opA: A->instructions)
