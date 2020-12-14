@@ -156,12 +156,42 @@ bool intersect(const unordered_set<T> &A, const unordered_set<T> &B) {
     });
 }
 
-void outputDILocationLine(DILocation *dil) {
-//    ifstream fs((dil->getDirectory() + "/" + dil->getFilename()).str());
-//    std::string line;
-//    for (int i = 0; i <= dil->getLine(); i++)
-//        std::getline(fs, line);
-    errs() << dil->getLine() << '\n';
+int getInstructionIndex(Instruction *target) {
+    int index = 0;
+    for (Instruction &op: *target->getParent())
+        if (&op == target)
+            return index;
+        else
+            ++index;
+    return -1;
+}
+
+bool printDebugLoc(const DebugLoc &dl) {
+    if (auto *dil = dl.get()) {
+        string line;
+        ifstream source((dil->getDirectory() + "/" + dil->getFilename()).str());
+        for (int i = 0; i < dil->getLine(); i++)
+            std::getline(source, line);
+
+        errs() << "\x1b[4m" << dil->getFilename() << ":L" << dil->getLine() << "\x1b[0m " << line << '\n';
+        return true;
+    } else {
+        errs() << "no source info :-(\n";
+        return false;
+    }
+}
+
+void printDatarace(Instruction *A, Instruction *B) {
+    errs() << "\x1b[1m\x1b[31mdata race between:\x1b[0m\n";
+    printDebugLoc(A->getDebugLoc());
+    A->getParent()->printAsOperand(errs(), false);
+    errs() << "(" << getInstructionIndex(A) << "): " << *A << '\n';
+    if (B != A) {
+        printDebugLoc(B->getDebugLoc());
+        B->getParent()->printAsOperand(errs(), false);
+        errs() << "(" << getInstructionIndex(A) << "): " << *A << '\n';
+    } else
+        errs() << "and itself in another thread\n";
 }
 
 template<typename C>
@@ -198,7 +228,7 @@ bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lo
             AliasResult result = aas.alias(MemoryLocation::get(A), MemoryLocation::get(B));
             if ((result == PartialAlias || result == MustAlias) &&
                 findLockIn(Lock(MemoryLocation::get(A)), allLocks, aas) == allLocks.end()) {
-                errs() << "data race:\n" << *A << '\n' << *B << '\n';
+                printDatarace(A, B);
                 return true;
             }
         }
@@ -390,8 +420,8 @@ namespace {
                     }
             }
 
-            errs() << "Number of locks detected: " << allLocks.size() << '\n';
-            errs() << "Number of CVs detected: " << allCVs.size() << '\n';
+            errs() << "Number of locks detected: " << allLocks.size() << "; Number of CVs detected: " << allCVs.size() << '\n';
+            errs() << '\n';
             // now we have all the locks canonically, we actually compute the lock set with a general DFA
             bool updated = true;
             while (updated) {
