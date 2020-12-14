@@ -12,10 +12,14 @@
 #include "llvm/IR/Instruction.def"
 #include "llvm/Support/Format.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <fstream>
 
 using namespace llvm;
 using namespace std;
@@ -65,6 +69,63 @@ namespace std {
     };
 }
 
+struct AASummary {
+    AAQueryInfo AAQI;
+    BasicAAResult baa;
+    ScopedNoAliasAAResult snaaa;
+    TypeBasedAAResult tbaa;
+    GlobalsAAResult gaa;
+    SCEVAAResult scevaa;
+    CFLAndersAAResult cflaaa;
+    CFLSteensAAResult cflsaa;
+
+    AliasResult alias(const MemoryLocation &A, const MemoryLocation &B) {
+        AAQueryInfo::LocPair Locs(A, B);
+
+        // Return cached alias result if it exists
+        auto hit = AAQI.AliasCache.find(Locs);
+        if (hit != AAQI.AliasCache.end()) {
+            return hit->second;
+        }
+        // Go through all passes and cache strictest alias result
+        vector<AliasResult> results;
+        auto I = AAQueryInfo();
+        results.push_back(baa.alias(A, B, I));
+        I = AAQueryInfo();
+        results.push_back(snaaa.alias(A, B, I));
+        I = AAQueryInfo();
+        results.push_back(tbaa.alias(A, B, I));
+        I = AAQueryInfo();
+        results.push_back(gaa.alias(A, B, I));
+        I = AAQueryInfo();
+        results.push_back(scevaa.alias(A, B, I));
+        I = AAQueryInfo();
+        results.push_back(cflaaa.alias(A, B, I));
+        I = AAQueryInfo();
+        results.push_back(cflsaa.alias(A, B, I));
+
+        for (auto &R : results) {
+            if (R == MustAlias) {
+                AAQI.AliasCache.insert(make_pair(Locs, R));
+                return R;
+            }
+        }
+        for (auto &R : results) {
+            if (R == PartialAlias) {
+                AAQI.AliasCache.insert(make_pair(Locs, R));
+                return R;
+            }
+        }
+        for (auto &R : results) {
+            if (R == NoAlias) {
+                AAQI.AliasCache.insert(make_pair(Locs, R));
+                return R;
+            }
+        }
+        return MayAlias;
+    }
+};
+
 struct Segment {
     BasicBlock *parent = nullptr;
     vector<Instruction *> instructions;
@@ -88,63 +149,39 @@ void unionWith(unordered_set<T> &target, const C &with) {
         target.insert(t);
 }
 
-namespace {
-    struct AASummary {
-        AAQueryInfo AAQI;
-        BasicAAResult baa;
-        ScopedNoAliasAAResult snaaa;
-        TypeBasedAAResult tbaa;
-        GlobalsAAResult gaa;
-        SCEVAAResult scevaa;
-        CFLAndersAAResult cflaaa;
-        CFLSteensAAResult cflsaa;
+template<typename T>
+bool intersect(const unordered_set<T> &A, const unordered_set<T> &B) {
+    return any_of(A.begin(), A.end(), [&](const T &x) {
+        return B.find(x) != B.end();
+    });
+}
 
-        AliasResult alias(const MemoryLocation &A, const MemoryLocation &B) {
-            AAQueryInfo::LocPair Locs(A, B);
+void outputDILocationLine(DILocation *dil) {
+//    ifstream fs((dil->getDirectory() + "/" + dil->getFilename()).str());
+//    std::string line;
+//    for (int i = 0; i <= dil->getLine(); i++)
+//        std::getline(fs, line);
+    errs() << dil->getLine() << '\n';
+}
 
-            // Return cached alias result if it exists
-            auto hit = AAQI.AliasCache.find(Locs);
-            if (hit != AAQI.AliasCache.end()) {
-                return hit->second;
+bool detectRace(Instruction *A, Instruction *B, AASummary &aas) {
+    auto codeA = A->getOpcode(), codeB = B->getOpcode();
+    switch ((codeA << 16u) | codeB) {
+        case (Instruction::Store << 16u) | Instruction::Store:
+        case (Instruction::Store << 16u) | Instruction::Load:
+        case (Instruction::Load << 16u) | Instruction::Store: {
+            AliasResult result = aas.alias(MemoryLocation::get(A), MemoryLocation::get(B));
+            if (result == PartialAlias || result == MustAlias) {
+                errs() << "data race:\n" << *A << '\n' << *B << '\n';
+                return true;
             }
-            // Go through all passes and cache strictest alias result
-            vector<AliasResult> results;
-            auto I = AAQueryInfo();
-            results.push_back(baa.alias(A, B, I));
-            I = AAQueryInfo();
-            results.push_back(snaaa.alias(A, B, I));
-            I = AAQueryInfo();
-            results.push_back(tbaa.alias(A, B, I));
-            I = AAQueryInfo();
-            results.push_back(gaa.alias(A, B, I));
-            I = AAQueryInfo();
-            results.push_back(scevaa.alias(A, B, I));
-            I = AAQueryInfo();
-            results.push_back(cflaaa.alias(A, B, I));
-            I = AAQueryInfo();
-            results.push_back(cflsaa.alias(A, B, I));
-
-            for (auto &R : results) {
-                if (R == MustAlias) {
-                    AAQI.AliasCache.insert(make_pair(Locs, R));
-                    return R;
-                }
-            }
-            for (auto &R : results) {
-                if (R == PartialAlias) {
-                    AAQI.AliasCache.insert(make_pair(Locs, R));
-                    return R;
-                }
-            }
-            for (auto &R : results) {
-                if (R == NoAlias) {
-                    AAQI.AliasCache.insert(make_pair(Locs, R));
-                    return R;
-                }
-            }
-            return MayAlias;
         }
-    };
+        default:
+            return false;
+    }
+}
+
+namespace {
 
     template<typename C>
     typename C::iterator findLockIn(const Lock &target, C &lockSet, AASummary &aas) {
@@ -227,8 +264,10 @@ namespace {
 
     struct OMPRacePass : public llvm::FunctionPass {
         bool runOnFunction(llvm::Function &F) override {
-            if (!F.getName().startswith(".omp_outlined."))
+            if (!F.getName().startswith(".omp_outlined.")) {
+                errs() << "Skipping " << F.getName() << "(...) because it is not an OpenMP outlined function.\n";
                 return false; // not function of interest
+            }
 
             AASummary aas = {
                     AAQueryInfo(),
@@ -240,7 +279,7 @@ namespace {
                     std::move(getAnalysis<CFLAndersAAWrapperPass>().getResult()),
                     std::move(getAnalysis<CFLSteensAAWrapperPass>().getResult())
             };
-            errs() << "Working on OpenMP outlined function " << F.getName() << '\n';
+            errs() << "\nDetected OpenMP outlined function " << F.getName() << "(...)\n";
 
             unordered_map<BasicBlock *, vector<Segment *>> mapBB2Seg;
 
@@ -412,38 +451,36 @@ namespace {
                 seg->outSet.clear();
 
             // compute happen-before relations
-            for (auto &bb: F) {
-                for (Segment *seg: allSegs)
-                    if (auto *callInst = dyn_cast<CallInst>(seg->instructions.back())) {
-                        StringRef calledFuncName = callInst->getCalledFunction()->getName();
-                        // 1. barrier happen-before
-                        if (calledFuncName.equals("__kmpc_barrier")) {
-                            // this segment happens before all of its successors
-                            unionWith(seg->happensBefore, seg->succ);
-                        } // 2. cv happen before
-                        else if (calledFuncName.equals("pthread_cond_signal") ||
-                                 calledFuncName.equals("pthread_cond_broadcast")) {
-                            for (Segment *waitSeg: allSegs) {
-                                if (auto *waitCallInst = dyn_cast<CallInst>(waitSeg->instructions.back())) {
-                                    if (waitCallInst->getCalledFunction()->getName().equals("pthread_cond_wait")) {
-                                        AliasResult ar = aas.alias(
-                                                MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0))),
-                                                MemoryLocation::get(dyn_cast<LoadInst>(waitCallInst->getArgOperand(0)))
-                                        );
-                                        if (ar == MustAlias ||
-                                            ar == PartialAlias) {
-                                            // signal/broadcaster happens before the successors of waiter
-                                            for (Segment *succ: waitSeg->succ)
-                                                succ->happensBefore.insert(seg);
-                                        }
-
+            for (Segment *seg: allSegs)
+                if (auto *callInst = dyn_cast<CallInst>(seg->instructions.back())) {
+                    StringRef calledFuncName = callInst->getCalledFunction()->getName();
+                    // 1. barrier happen-before
+                    if (calledFuncName.equals("__kmpc_barrier")) {
+                        // this segment happens before all of its successors
+                        unionWith(seg->happensBefore, seg->succ);
+                    } // 2. cv happen before
+                    else if (calledFuncName.equals("pthread_cond_signal") ||
+                             calledFuncName.equals("pthread_cond_broadcast")) {
+                        for (Segment *waitSeg: allSegs) {
+                            if (auto *waitCallInst = dyn_cast<CallInst>(waitSeg->instructions.back())) {
+                                if (waitCallInst->getCalledFunction()->getName().equals("pthread_cond_wait")) {
+                                    AliasResult ar = aas.alias(
+                                            MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0))),
+                                            MemoryLocation::get(dyn_cast<LoadInst>(waitCallInst->getArgOperand(0)))
+                                    );
+                                    if (ar == MustAlias ||
+                                        ar == PartialAlias) {
+                                        // signal/broadcaster happens before the successors of waiter
+                                        for (Segment *succ: waitSeg->succ)
+                                            succ->happensBefore.insert(seg);
                                     }
+
                                 }
                             }
                         }
-
                     }
-            }
+
+                }
             // happen-before relation is transitive
             updated = true;
             while (updated) {
@@ -460,6 +497,17 @@ namespace {
             // TODO think about what happen-before relations are nullified by back-edge
 
             // TODO: access with atomicrmw should ignore lock set. They are generated with #pragma omp atomic
+
+            // detect race!
+            for (Segment *A: allSegs)
+                for (Segment *B: allSegs)
+                    if (A->happensBefore.find(B) == A->happensBefore.end() &&
+                        B->happensBefore.find(A) == B->happensBefore.end() &&
+                        !intersect(A->lockSet, B->lockSet)) {
+                        for (Instruction *opA: A->instructions)
+                            for (Instruction *opB: B->instructions)
+                                detectRace(opA, opB, aas);
+                    }
 
             errs() << '\n';
             return false;
