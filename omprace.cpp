@@ -212,13 +212,13 @@ namespace {
         seg->lockSet.clear();
         for (Segment *pred: seg->pred)
             unionWith(seg->lockSet, pred->outSet);
-        unordered_set<Lock> oldOutSeg = std::move(seg->outSet);
+        unordered_set<Lock> oldOutSet = std::move(seg->outSet);
         seg->outSet = seg->lockSet;
 
         Instruction *endOp = seg->instructions.back();
         if (endOp->isTerminator()) {
             // this segment ends naturally, nothing is killed/generated
-            return false;
+            return oldOutSet != seg->lockSet;
         } else {
             // this segment ends because of a syncing operation
             // which is a function call
@@ -230,33 +230,33 @@ namespace {
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock newLock = *findLockIn(Lock(memLoc), allLocks, aas);
                 seg->outSet.insert(newLock);
-                return seg->outSet != oldOutSeg;
+                return seg->outSet != oldOutSet;
             } else if (callee->getName().equals("omp_unset_lock") ||
                        callee->getName().equals("pthread_mutex_unlock")) {
                 // kill a lock
                 MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
                 Lock deadLock = *findLockIn(Lock(memLoc), allLocks, aas);
                 seg->outSet.erase(deadLock);
-                return seg->outSet != oldOutSeg;
+                return seg->outSet != oldOutSet;
             } else if (callee->getName().equals("__kmpc_critical")) {
                 // gen a new lock
                 Value *critLock = callInst->getArgOperand(2);
                 Lock newLock = *findLockIn(Lock(critLock), allLocks, aas);
                 seg->outSet.insert(newLock);
-                return seg->outSet != oldOutSeg;
+                return seg->outSet != oldOutSet;
             } else if (callee->getName().equals("__kmpc_end_critical")) {
                 // kill a lock
                 Value *critLock = callInst->getArgOperand(2);
                 Lock deadLock = *findLockIn(Lock(critLock), allLocks, aas);
                 seg->outSet.erase(deadLock);
-                return seg->outSet != oldOutSeg;
+                return seg->outSet != oldOutSet;
             } else if (callee->getName().equals("pthread_cond_wait")) {
                 // cv.wait() also kill a lock
                 // but cv.signal()/broadcast() does not
                 Value *critLock = callInst->getArgOperand(1);
                 Lock deadLock = *findLockIn(Lock(critLock), allLocks, aas);
                 seg->outSet.erase(deadLock);
-                return seg->outSet != oldOutSeg;
+                return seg->outSet != oldOutSet;
             }
         }
         return false;
@@ -346,30 +346,6 @@ namespace {
                 }
             }
 
-#ifdef VERBOSE_DEBUG
-            for (BasicBlock &bb: F) {
-                bb.printAsOperand(errs(), false);
-                errs() << '\n';
-                for (Segment *seg: mapBB2Seg[&bb]) {
-                    seg->dump();
-                    errs() << "pred: " << seg->pred.size() << ' ';
-                    for (Segment *pred: seg->pred) {
-                        pred->parent->printAsOperand(errs(), false);
-                        errs() << ' ';
-                    }
-                    errs() << '\n';
-                    errs() << "succ: " << seg->succ.size() << ' ';
-                    for (Segment *succ: seg->succ) {
-                        succ->parent->printAsOperand(errs(), false);
-                        errs() << ' ';
-                    }
-                    errs() << '\n';
-                    errs() << "            -----------------------------------------------------------------\n";
-                }
-                errs() << "=============================================================================\n";
-            }
-#endif
-
             // compute the lock set
             // first, we make a canonical list of all the locks and cvs
             // we use the same infrastructure (memory-location-based lock) for CVs
@@ -417,34 +393,36 @@ namespace {
             errs() << "Number of locks detected: " << allLocks.size() << '\n';
             errs() << "Number of CVs detected: " << allCVs.size() << '\n';
             // now we have all the locks canonically, we actually compute the lock set with a general DFA
-#ifdef VERBOSE_DEBUG
-            for (int i = 0; i < 3; i++) {
-                bool updated = false;
-                errs() << "\n\niter " << i << "\n";
-                for (Segment *seg: allSegs)
-                    if (updateLockSet(seg, allLocks, aas)) {
-                        errs() << ".........\n";
-                        seg->dump();
-                        errs() << "\n.........\n";
-                        updated = true;
-                    }
-                for (Segment *seg: allSegs) {
-                    seg->dump();
-                    if (!seg->lockSet.empty())
-                        errs() << "!!!!!!!" << seg->lockSet.size() << "\n";
-                    if (!seg->outSet.empty())
-                        errs() << "???????" << seg->outSet.size() << "\n";
-                    errs() << '\n';
-                }
-                if (!updated)
-                    break;
-            }
-#endif
             bool updated = true;
             while (updated) {
                 updated = false;
                 for (Segment *seg: allSegs)
                     updated = updated || updateLockSet(seg, allLocks, aas);
+#ifdef VERBOSE_DEBUG
+                for (auto &BB: F) {
+                    for (Segment *seg: mapBB2Seg[&BB]) {
+                        seg->dump();
+                        if (!seg->lockSet.empty())
+                            errs() << "lock set: " << seg->lockSet.size() << "\n";
+                        if (!seg->outSet.empty())
+                            errs() << "out set: " << seg->outSet.size() << "\n";
+                        errs() << "pred: " << seg->pred.size() << ' ';
+                        for (Segment *pred: seg->pred) {
+                            pred->parent->printAsOperand(errs(), false);
+                            errs() << ' ';
+                        }
+                        errs() << '\n';
+                        errs() << "succ: " << seg->succ.size() << ' ';
+                        for (Segment *succ: seg->succ) {
+                            succ->parent->printAsOperand(errs(), false);
+                            errs() << ' ';
+                        }
+                        errs() << '\n';
+                    }
+                    errs() << '\n';
+                    errs() << '\n';
+                }
+#endif
             }
             // clear outSet since we no longer need it
             for (Segment *seg: allSegs)
@@ -499,15 +477,20 @@ namespace {
             // TODO: access with atomicrmw should ignore lock set. They are generated with #pragma omp atomic
 
             // detect race!
-            for (Segment *A: allSegs)
-                for (Segment *B: allSegs)
+            bool raceDetected = false;
+            for (auto i = allSegs.begin(); i != allSegs.end(); i++)
+                for (auto j = i; j != allSegs.end(); j++) {
+                    Segment *A = *i, *B = *j;
                     if (A->happensBefore.find(B) == A->happensBefore.end() &&
                         B->happensBefore.find(A) == B->happensBefore.end() &&
                         !intersect(A->lockSet, B->lockSet)) {
                         for (Instruction *opA: A->instructions)
                             for (Instruction *opB: B->instructions)
-                                detectRace(opA, opB, aas, allLocks);
+                                raceDetected = raceDetected || detectRace(opA, opB, aas, allLocks);
                     }
+                }
+            if (!raceDetected)
+                errs() << "no data race detected\n";
 
             errs() << '\n';
             return false;
