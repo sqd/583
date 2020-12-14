@@ -295,9 +295,15 @@ namespace {
     struct OMPRacePass : public llvm::FunctionPass {
         bool runOnFunction(llvm::Function &F) override {
             if (!F.getName().startswith(".omp_outlined.")) {
-                errs() << "Skipping " << F.getName() << "(...) because it is not an OpenMP outlined function.\n";
+                errs() << "Skipping " << F.getName() << "(...): not an OpenMP outlined function.\n";
                 return false; // not function of interest
             }
+
+            SmallVector<std::pair<unsigned, MDNode *>, 10> MDs;
+            F.getAllMetadata(MDs);
+            if (MDs.empty())
+                errs() << "\x1b[1m\x1b[31mNo metadata detected. Source info will likely be not available. "
+                          "Did you compile with -g -O0?\n\x1b[0m";
 
             AASummary aas = {
                     AAQueryInfo(),
@@ -420,7 +426,8 @@ namespace {
                     }
             }
 
-            errs() << "Number of locks detected: " << allLocks.size() << "; Number of CVs detected: " << allCVs.size() << '\n';
+            errs() << "Number of locks detected: " << allLocks.size() << "; Number of CVs detected: " << allCVs.size()
+                   << '\n';
             errs() << '\n';
             // now we have all the locks canonically, we actually compute the lock set with a general DFA
             bool updated = true;
