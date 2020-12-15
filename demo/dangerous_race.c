@@ -9,9 +9,9 @@ int main() {
     while (1) {
         int tid = omp_get_thread_num();
         if (tid % 2)
-            sum++;
+            sum += 333;
         else
-            sum--;
+            sum -= 444;
     }
 
 }

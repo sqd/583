@@ -69,6 +69,14 @@ namespace std {
     };
 }
 
+MemoryLocation getMemLoc(Value *v) {
+    if (auto op = dyn_cast<LoadInst>(v))
+        return MemoryLocation::get(op);
+    if (auto op = dyn_cast<AllocaInst>(v))
+        return MemoryLocation::get(op);
+    assert(false);
+}
+
 struct AASummary {
     AAQueryInfo AAQI;
     BasicAAResult baa;
@@ -99,10 +107,14 @@ struct AASummary {
         results.push_back(gaa.alias(A, B, I));
         I = AAQueryInfo();
         results.push_back(scevaa.alias(A, B, I));
-        I = AAQueryInfo();
-        results.push_back(cflaaa.alias(A, B, I));
-        I = AAQueryInfo();
-        results.push_back(cflsaa.alias(A, B, I));
+        try {
+            I = AAQueryInfo();
+            results.push_back(cflaaa.alias(A, B, I));
+        } catch (std::bad_function_call &) {}
+        try {
+            I = AAQueryInfo();
+            results.push_back(cflsaa.alias(A, B, I));
+        } catch (std::bad_function_call &) {}
 
         for (auto &R : results) {
             if (R == MustAlias) {
@@ -182,14 +194,14 @@ bool printDebugLoc(const DebugLoc &dl) {
 }
 
 void printDatarace(Instruction *A, Instruction *B) {
-    errs() << "\x1b[1m\x1b[31mdata race between:\x1b[0m\n";
+    errs() << "\x1b[1m\x1b[31mpotential data race between:\x1b[0m\n";
     printDebugLoc(A->getDebugLoc());
     A->getParent()->printAsOperand(errs(), false);
     errs() << "(" << getInstructionIndex(A) << "): " << *A << '\n';
     if (B != A) {
         printDebugLoc(B->getDebugLoc());
         B->getParent()->printAsOperand(errs(), false);
-        errs() << "(" << getInstructionIndex(A) << "): " << *B << '\n';
+        errs() << "(" << getInstructionIndex(B) << "): " << *B << '\n';
     } else
         errs() << "and itself in another thread\n";
 }
@@ -219,7 +231,8 @@ typename C::iterator findLockIn(const Lock &target, C &lockSet, AASummary &aas) 
     }
 }
 
-bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lock> &allLocks) {
+bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lock> &allLocks,
+                const vector<MemoryLocation> &ignoring) {
     auto codeA = A->getOpcode(), codeB = B->getOpcode();
     if ((codeA == Instruction::Store && codeB == Instruction::Load) ||
         (codeA == Instruction::Load && codeB == Instruction::Store) ||
@@ -228,6 +241,13 @@ bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lo
         AliasResult result = aas.alias(MemoryLocation::get(A), MemoryLocation::get(B));
         if ((result == PartialAlias || result == MustAlias) &&
             findLockIn(Lock(MemoryLocation::get(A)), allLocks, aas) == allLocks.end()) {
+            // ignore some control blocks for omp; just like locks, they are not meant to be safe in an axiomatic sense
+            for (const auto &ignoredMem: ignoring) {
+                result = aas.alias(ignoredMem, MemoryLocation::get(A));
+                if (result != NoAlias)
+                    return false;
+            }
+            // found a data race!
             printDatarace(A, B);
             return true;
         }
@@ -255,14 +275,14 @@ namespace {
             if (callee->getName().equals("omp_set_lock") ||
                 callee->getName().equals("pthread_mutex_lock")) {
                 // gen a new lock
-                MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
+                MemoryLocation memLoc = getMemLoc(callInst->getArgOperand(0));
                 Lock newLock = *findLockIn(Lock(memLoc), allLocks, aas);
                 seg->outSet.insert(newLock);
                 return seg->outSet != oldOutSet;
             } else if (callee->getName().equals("omp_unset_lock") ||
                        callee->getName().equals("pthread_mutex_unlock")) {
                 // kill a lock
-                MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
+                MemoryLocation memLoc = getMemLoc(callInst->getArgOperand(0));
                 Lock deadLock = *findLockIn(Lock(memLoc), allLocks, aas);
                 seg->outSet.erase(deadLock);
                 return seg->outSet != oldOutSet;
@@ -297,12 +317,14 @@ namespace {
                 return false; // not function of interest
             }
 
+            // test for metadata and output warning if not found
             SmallVector<std::pair<unsigned, MDNode *>, 10> MDs;
             F.getAllMetadata(MDs);
             if (MDs.empty())
                 errs() << "\x1b[1m\x1b[31mNo metadata detected. Source info will likely be not available. "
                           "Did you compile with -g -O0?\n\x1b[0m";
 
+            // alias analysis summary
             AASummary aas = {
                     AAQueryInfo(),
                     getAnalysis<BasicAAWrapperPass>().getResult(),
@@ -315,16 +337,19 @@ namespace {
             };
             errs() << "\nDetected OpenMP outlined function " << F.getName() << "(...)\n";
 
+            // other records we keep
+            auto tli = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
             unordered_map<BasicBlock *, vector<Segment *>> mapBB2Seg;
+            vector<MemoryLocation> ompRuntimeControlMem;
 
             // form segments
-            unordered_set<Segment *> allSegs;
+            vector<Segment *> allSegs;
             for (auto &bb: F) {
                 Segment *curSeg = nullptr;
                 for (auto &op: bb) {
                     if (curSeg == nullptr) {
                         curSeg = new Segment();
-                        allSegs.insert(curSeg);
+                        allSegs.push_back(curSeg);
                         curSeg->parent = &bb;
                         // we compute the predecessors after we are done with all BBs
                         mapBB2Seg[&bb].push_back(curSeg);
@@ -350,10 +375,17 @@ namespace {
 
                             // syncing operations, start a new segment
                             auto *newSeg = new Segment();
-                            allSegs.insert(newSeg);
+                            allSegs.push_back(newSeg);
                             newSeg->parent = &bb;
                             curSeg = newSeg;
                             mapBB2Seg[&bb].push_back(curSeg);
+                        }
+                        if (callee->getName().startswith("__kmpc_for_static_init")) {
+                            // we want to filter out omp runtime control memory later
+                            for (int i = 3; i <= 6; i++) {
+                                Value *arg = callInst->getArgOperand(i);
+                                ompRuntimeControlMem.push_back(MemoryLocation(arg));
+                            }
                         }
                     }
                 }
@@ -393,7 +425,7 @@ namespace {
                             callee->getName().equals("pthread_mutex_lock") ||
                             callee->getName().equals("pthread_mutex_unlock")) {
 
-                            MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
+                            MemoryLocation memLoc = getMemLoc(callInst->getArgOperand(0));
                             // is this a new lock?
                             if (findLockIn(Lock(memLoc), allLocks, aas) == allLocks.end())
                                 allLocks.emplace(memLoc);
@@ -409,14 +441,13 @@ namespace {
                                    callee->getName().equals("pthread_cond_broadcast")) {
                             if (callee->getName().equals("pthread_cond_wait")) {
                                 // this could also introduce a lock not seen before
-                                MemoryLocation memLoc = MemoryLocation::get(
-                                        dyn_cast<LoadInst>(callInst->getArgOperand(1)));
+                                MemoryLocation memLoc = getMemLoc(callInst->getArgOperand(1));
                                 // is this a new lock?
                                 if (findLockIn(Lock(memLoc), allLocks, aas) == allLocks.end())
                                     allLocks.emplace(memLoc);
                             }
                             // keeping tab of CVs
-                            MemoryLocation memLoc = MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0)));
+                            MemoryLocation memLoc = getMemLoc(callInst->getArgOperand(0));
                             // is this a new CV?
                             if (findLockIn(Lock(memLoc), allCVs, aas) == allCVs.end())
                                 allCVs.emplace(memLoc);
@@ -478,8 +509,8 @@ namespace {
                             if (auto *waitCallInst = dyn_cast<CallInst>(waitSeg->instructions.back())) {
                                 if (waitCallInst->getCalledFunction()->getName().equals("pthread_cond_wait")) {
                                     AliasResult ar = aas.alias(
-                                            MemoryLocation::get(dyn_cast<LoadInst>(callInst->getArgOperand(0))),
-                                            MemoryLocation::get(dyn_cast<LoadInst>(waitCallInst->getArgOperand(0)))
+                                            getMemLoc(callInst->getArgOperand(0)),
+                                            getMemLoc(waitCallInst->getArgOperand(0))
                                     );
                                     if (ar == MustAlias ||
                                         ar == PartialAlias) {
@@ -499,17 +530,14 @@ namespace {
             while (updated) {
                 updated = false;
                 for (Segment *seg: allSegs)
-                    for (Segment *after: seg->happensBefore)
+                    for (Segment *after: seg->happensBefore) {
                         for (Segment *afterAfter: after->happensBefore)
                             if (seg->happensBefore.find(afterAfter) == seg->happensBefore.end()) {
                                 seg->happensBefore.insert(afterAfter);
                                 updated = true;
                             }
+                    }
             }
-
-            // TODO think about what happen-before relations are nullified by back-edge
-
-            // TODO: access with atomicrmw should ignore lock set. They are generated with #pragma omp atomic
 
             // detect race!
             bool raceDetected = false;
@@ -518,11 +546,12 @@ namespace {
                     Segment *A = *i, *B = *j;
                     if (A->happensBefore.find(B) == A->happensBefore.end() &&
                         B->happensBefore.find(A) == B->happensBefore.end() &&
-                        !intersect(A->lockSet, B->lockSet)) {
+                        !intersect(A->lockSet, B->lockSet))
                         for (Instruction *opA: A->instructions)
-                            for (Instruction *opB: B->instructions)
-                                raceDetected = raceDetected || detectRace(opA, opB, aas, allLocks);
-                    }
+                            for (Instruction *opB: B->instructions) {
+                                raceDetected = detectRace(opA, opB, aas, allLocks, ompRuntimeControlMem)
+                                               || raceDetected;
+                            }
                 }
             if (!raceDetected)
                 errs() << "no data race detected\n";
@@ -547,6 +576,8 @@ namespace {
             usage.addRequired<SCEVAAWrapperPass>();
             usage.addRequired<CFLAndersAAWrapperPass>();
             usage.addRequired<CFLSteensAAWrapperPass>();
+
+            usage.addRequired<TargetLibraryInfoWrapperPass>();
         };
     };
 
