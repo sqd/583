@@ -4,14 +4,16 @@
 #include <pthread.h>
 
 int main() {
-    int sum = 777;
+    int sum = 0;
 #pragma omp parallel
     while (1) {
         int tid = omp_get_thread_num();
         if (tid % 2)
-            sum += 333;
+#pragma omp critical(a_critical_section)
+            sum += 583;
         else
-            sum -= 444;
+#pragma omp critical(another_critical_section)
+            sum -= 583;
     }
 
 }

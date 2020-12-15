@@ -3,18 +3,20 @@
 #include <stdlib.h>
 #include <pthread.h>
 
+void do_stuff(int);
+
 int main() {
     omp_lock_t lock;
-    int sum = 0;
+    int iter = 0;
+
 #pragma omp parallel
-    while (1) {
-        int tid = omp_get_thread_num();
+    // forgot to lock this check!
+    while (iter < 583583) {
         omp_set_lock(&lock);
-        if (tid % 2)
-            sum += 583;
-        else
-            sum -= 583;
+        int task = iter++;
         omp_unset_lock(&lock);
+
+        do_stuff(task);
     }
 
 }
