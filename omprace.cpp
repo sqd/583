@@ -569,19 +569,31 @@ namespace {
                     Segment *A = *i, *B = *j;
                     if (A->happensBefore.find(B) == A->happensBefore.end() &&
                         B->happensBefore.find(A) == B->happensBefore.end() &&
-                        !intersect(A->lockSet, B->lockSet))
-                        for (Instruction *opA: A->instructions)
-                            for (Instruction *opB: B->instructions) {
-                                raceDetected = detectRace(opA, opB, aas, allLocks, ompRuntimeControlMem, interestedSet)
-                                               || raceDetected;
-                            }
+                        !intersect(A->lockSet, B->lockSet)) {
+                        if (A != B)
+                            for (Instruction *opA: A->instructions)
+                                for (Instruction *opB: B->instructions) {
+                                    raceDetected =
+                                            detectRace(opA, opB, aas, allLocks, ompRuntimeControlMem, interestedSet)
+                                            || raceDetected;
+                                }
+                        else {
+                            // aesthetic, don't double-loop
+                            for (auto k = A->instructions.begin(); k != A->instructions.end(); k++)
+                                for (auto l = k; l != A->instructions.end(); l++) {
+                                    raceDetected =
+                                            detectRace(*k, *l, aas, allLocks, ompRuntimeControlMem, interestedSet)
+                                            || raceDetected;
+                                }
+                        }
+                    }
                 }
+
             if (!raceDetected)
                 errs() << "no data race detected\n";
 
             errs() << '\n';
             return false;
-
         }
 
         static char ID;
