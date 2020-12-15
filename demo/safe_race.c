@@ -5,7 +5,7 @@
 
 int main() {
     omp_lock_t lock;
-    int sum = 0;
+    int sum = 777;
 #pragma omp parallel
     while (1) {
         int tid = omp_get_thread_num();

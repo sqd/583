@@ -15,6 +15,7 @@
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/Analysis/MemoryLocation.h"
 
 #include <vector>
 #include <unordered_map>
@@ -231,8 +232,16 @@ typename C::iterator findLockIn(const Lock &target, C &lockSet, AASummary &aas) 
     }
 }
 
+Value *getPointerReference(Instruction *op) {
+    if (auto *loadInst = dyn_cast<LoadInst>(op))
+        return loadInst->getPointerOperand();
+    if (auto *storeInst = dyn_cast<StoreInst>(op))
+        return storeInst->getPointerOperand();
+    return nullptr;
+}
+
 bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lock> &allLocks,
-                const vector<MemoryLocation> &ignoring) {
+                const vector<MemoryLocation> &ignoring, const vector<MemoryLocation> &interested) {
     auto codeA = A->getOpcode(), codeB = B->getOpcode();
     if ((codeA == Instruction::Store && codeB == Instruction::Load) ||
         (codeA == Instruction::Load && codeB == Instruction::Store) ||
@@ -246,6 +255,11 @@ bool detectRace(Instruction *A, Instruction *B, AASummary &aas, unordered_set<Lo
                 result = aas.alias(ignoredMem, MemoryLocation::get(A));
                 if (result != NoAlias)
                     return false;
+            }
+            if (find_if(interested.begin(), interested.end(), [&](const MemoryLocation &interestedML) {
+                return aas.alias(interestedML, MemoryLocation::get(A)) != NoAlias;
+            }) == interested.end()) {
+                return false; // not interested
             }
             // found a data race!
             printDatarace(A, B);
@@ -341,6 +355,7 @@ namespace {
             auto tli = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
             unordered_map<BasicBlock *, vector<Segment *>> mapBB2Seg;
             vector<MemoryLocation> ompRuntimeControlMem;
+            vector<MemoryLocation> interestedSet; // outlined yet shared pointer
 
             // form segments
             vector<Segment *> allSegs;
@@ -384,7 +399,7 @@ namespace {
                             // we want to filter out omp runtime control memory later
                             for (int i = 3; i <= 6; i++) {
                                 Value *arg = callInst->getArgOperand(i);
-                                ompRuntimeControlMem.push_back(MemoryLocation(arg));
+                                ompRuntimeControlMem.emplace_back(arg);
                             }
                         }
                     }
@@ -453,6 +468,14 @@ namespace {
                                 allCVs.emplace(memLoc);
                         }
                     }
+            }
+
+            // compute interested set
+            const auto &dl = F.getParent()->getDataLayout();
+            for (int i = 2; i < F.arg_size(); i++) {
+                Argument *arg = F.getArg(i);
+                auto sz = LocationSize::precise(dl.getTypeStoreSize(arg->getType()));
+                interestedSet.emplace_back(arg, sz);
             }
 
             errs() << "Number of locks detected: " << allLocks.size() << "; Number of CVs detected: " << allCVs.size()
@@ -549,7 +572,7 @@ namespace {
                         !intersect(A->lockSet, B->lockSet))
                         for (Instruction *opA: A->instructions)
                             for (Instruction *opB: B->instructions) {
-                                raceDetected = detectRace(opA, opB, aas, allLocks, ompRuntimeControlMem)
+                                raceDetected = detectRace(opA, opB, aas, allLocks, ompRuntimeControlMem, interestedSet)
                                                || raceDetected;
                             }
                 }
